@@ -1,15 +1,33 @@
-*.iml
+# --- User Configuration & PII (CRITICAL) ---
+local.properties
+
+# --- Android / Gradle Build Artifacts ---
 .gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
 /build
-/captures
+/*/build
+*.iml
+*.apk
+*.aab
+*.aar
+
+# --- Android Studio / IntelliJ ---
+# We ignore the whole folder usually, but keeping your specific exclusions is fine.
+# These specific ones are good to add to your list:
+.idea/
+.navigation/
+captures/
 .externalNativeBuild
 .cxx
-local.properties
+
+# --- OS Junk ---
+.DS_Store
+Thumbs.db
+
+# --- SECURITY (CRITICAL) ---
+# Never commit these. Even for a hobby project.
+*.jks
+*.keystore
+*.pem
+*.p12
+*.key
+google-services.json

@@ -57,27 +57,52 @@ class MainActivity : ComponentActivity() {
 // --- MODELS & ENGINES ---
 data class LightPoint(val x: Float, val y: Float, var life: Float = 1.0f, val color: Color)
 
+enum class FluxState {
+    MONITOR, // Low polling (5Hz), No Audio calc, No Haptic logic
+    ACTIVE   // High polling (50Hz), Full Audio/Haptics
+}
+
 class SynthEngine {
     private val sampleRate = 44100
     private val buffSize = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
     private var audioTrack: AudioTrack? = null
     private var isRunning = false
+
+    // Optimization: Standby flag to sleep the thread
+    var isStandby = true
+
     var frequency = 440.0; var amplitude = 0.0; private var phase = 0.0
 
     fun start() {
         if (isRunning) return
-        audioTrack = AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build()).setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()).setBufferSizeInBytes(buffSize).setTransferMode(AudioTrack.MODE_STREAM).build()
-        audioTrack?.play(); isRunning = true
+        audioTrack = AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+            .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+            .setBufferSizeInBytes(buffSize)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        audioTrack?.play()
+        isRunning = true
+
         Thread {
             val buffer = ShortArray(buffSize / 2)
             while (isRunning) {
-                for (i in buffer.indices) {
-                    val angle = 2.0 * Math.PI * frequency * (phase / sampleRate)
-                    val sample = (sin(angle) * (amplitude * Short.MAX_VALUE)).toInt().toShort()
-                    buffer[i] = sample; phase++
+                // BATTERY SAVER: If standby or silent, don't do math.
+                if (isStandby || amplitude <= 0.01) {
+                    buffer.fill(0)
+                    // Sleep thread briefly to save CPU cycles
+                    try { Thread.sleep(50) } catch (e: Exception) {}
+                    try { audioTrack?.write(buffer, 0, buffer.size) } catch (e: Exception) {}
+                } else {
+                    // FLUX MODE: Full Synthesis
+                    for (i in buffer.indices) {
+                        val angle = 2.0 * Math.PI * frequency * (phase / sampleRate)
+                        val sample = (sin(angle) * (amplitude * Short.MAX_VALUE)).toInt().toShort()
+                        buffer[i] = sample; phase++
+                    }
+                    if (phase > sampleRate) phase -= sampleRate
+                    try { audioTrack?.write(buffer, 0, buffer.size) } catch (e: Exception) {}
                 }
-                if (phase > sampleRate) phase -= sampleRate
-                try { audioTrack?.write(buffer, 0, buffer.size) } catch (e: Exception) {}
             }
         }.start()
     }
@@ -112,6 +137,10 @@ fun OdradekSense() {
     val neonColors = listOf(Color(0xFF00FFCC), Color(0xFFD400FF), Color(0xFFCCFF00))
     val hapticNames = listOf("Dynamo", "Geiger", "Throb")
 
+    // --- BATTERY / FLUX STATE ---
+    var fluxState by remember { mutableStateOf(FluxState.MONITOR) }
+    var lastInteractionTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
     // Audio & Haptics
     val synth = remember { SynthEngine() }
     val vibrator = remember { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
@@ -122,25 +151,86 @@ fun OdradekSense() {
 
     DisposableEffect(Unit) { synth.start(); onDispose { synth.stop() } }
 
-    // --- SENSORS & LOOPS ---
-    DisposableEffect(isMotionMode) {
+    // --- DYNAMIC SENSOR LOOP ---
+    // Re-registers listener when FluxState changes to adjust polling rate
+    DisposableEffect(isMotionMode, fluxState) {
         if (isMotionMode) {
             val listener = object : SensorEventListener {
-                override fun onSensorChanged(event: SensorEvent?) { event?.let { val mag = sqrt(it.values[0].pow(2) + it.values[1].pow(2) + it.values[2].pow(2)); motionMagnitude = (motionMagnitude * 0.8f) + (mag * 0.2f) } }
+                override fun onSensorChanged(event: SensorEvent?) {
+                    event?.let {
+                        val mag = sqrt(it.values[0].pow(2) + it.values[1].pow(2) + it.values[2].pow(2))
+
+                        // Wake up logic
+                        if (mag > 1.2f) {
+                            lastInteractionTime = System.currentTimeMillis()
+                        }
+
+                        motionMagnitude = (motionMagnitude * 0.8f) + (mag * 0.2f)
+                    }
+                }
                 override fun onAccuracyChanged(s: Sensor?, a: Int) {}
             }
             val sensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
-            sensorManager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_GAME); onDispose { sensorManager.unregisterListener(listener) }
+
+            // Critical Optimization: SENSOR_DELAY_GAME (20ms) vs SENSOR_DELAY_NORMAL (200ms)
+            val delayType = if (fluxState == FluxState.ACTIVE) SensorManager.SENSOR_DELAY_GAME else SensorManager.SENSOR_DELAY_NORMAL
+
+            sensorManager.registerListener(listener, sensor, delayType)
+            onDispose { sensorManager.unregisterListener(listener) }
         } else { onDispose { } }
     }
 
+    // --- STATE MANAGEMENT LOOP ---
+    // Checks every 500ms to see if we should hibernate or wake up
+    LaunchedEffect(Unit) {
+        while(isActive) {
+            val now = System.currentTimeMillis()
+            val timeSinceInteraction = now - lastInteractionTime
+
+            if (fluxState == FluxState.ACTIVE) {
+                // If inactive for 5 seconds, drop to Monitor
+                if (timeSinceInteraction > 5000) {
+                    fluxState = FluxState.MONITOR
+                    motionMagnitude = 0f // Clamp down
+                }
+            } else {
+                // In Monitor mode, if interaction happened recently (via sensor or touch), wake up
+                if (timeSinceInteraction < 200) {
+                    fluxState = FluxState.ACTIVE
+                }
+            }
+
+            // Sync Synth State
+            synth.isStandby = (fluxState == FluxState.MONITOR)
+
+            delay(500)
+        }
+    }
+
     LaunchedEffect(Unit) { while (true) { timeText = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")); delay(1000) } }
-    LaunchedEffect(Unit) { while (true) { withFrameNanos { val i = points.iterator(); while(i.hasNext()) { val p=i.next(); p.life-=0.02f; if(p.life<=0f) i.remove() } } } }
+
+    // VISUAL LOOP
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameNanos {
+                if (points.isNotEmpty()) {
+                    val i = points.iterator();
+                    while(i.hasNext()) { val p=i.next(); p.life-=0.02f; if(p.life<=0f) i.remove() }
+                }
+            }
+        }
+    }
 
     // --- FEEDBACK LOOP ---
-    LaunchedEffect(modeIndex, hapticProfile, isTouching) {
+    LaunchedEffect(modeIndex, hapticProfile, isTouching, fluxState) {
         var lastNetworkSend = 0L
         while (isActive) {
+            // BATTERY GATE: If monitoring, skip heavy logic loop
+            if (fluxState == FluxState.MONITOR && !isTouching) {
+                delay(200)
+                continue
+            }
+
             var intensity = 0f
             if (isMotionMode) { intensity = (motionMagnitude / 8.0f).coerceIn(0f, 1f); if (intensity < 0.05f) intensity = 0f }
             else if (isTouching) { intensity = touchIntensity }
@@ -190,8 +280,11 @@ fun OdradekSense() {
                         scrollAccumulator += it.verticalScrollPixels
                         if (abs(scrollAccumulator) > scrollThreshold) {
                             val direction = if (scrollAccumulator > 0) 1 else -1
-                            // Crisp Haptic Click on change
                             vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+
+                            // Interaction here wakes up the engine too
+                            lastInteractionTime = System.currentTimeMillis()
+                            fluxState = FluxState.ACTIVE
 
                             var newIndex = modeIndex + direction
                             if (newIndex > 3) newIndex = 0; if (newIndex < 0) newIndex = 3
@@ -206,13 +299,9 @@ fun OdradekSense() {
         ) {
             LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
-            // 1. VISUALIZER (Inside Box to access pointerInput)
-// 1. VISUALIZER
+            // 1. VISUALIZER
             if (!isMenuOpen) {
                 Box(modifier = Modifier.fillMaxSize()) {
-                    // A: THE DRAWING LAYER (Background)
-                    // We use 'detectDragGesturesAfterLongPress' to allow clicks to pass through
-                    // to buttons if the user doesn't hold down.
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -220,13 +309,22 @@ fun OdradekSense() {
                                 if (!isMotionMode && !isMenuOpen) {
                                     detectDragGesturesAfterLongPress(
                                         onDragStart = { offset ->
-                                            // Haptic bump to let user know "It's active now"
                                             vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
                                             isTouching = true
+
+                                            // WAKE UP
+                                            lastInteractionTime = System.currentTimeMillis()
+                                            fluxState = FluxState.ACTIVE
+
                                             points.add(LightPoint(offset.x, offset.y, 1.0f, neonColors[colorIndex]))
                                         },
                                         onDrag = { change, _ ->
                                             isTouching = true
+
+                                            // KEEP AWAKE
+                                            lastInteractionTime = System.currentTimeMillis()
+                                            fluxState = FluxState.ACTIVE
+
                                             points.add(LightPoint(change.position.x, change.position.y, 1.0f, neonColors[colorIndex]))
                                             val d = sqrt((change.position.x - screenCenter).pow(2) + (change.position.y - screenCenter).pow(2))
                                             touchIntensity = 1.0f - (d / screenCenter).coerceIn(0f, 1f)
@@ -237,9 +335,11 @@ fun OdradekSense() {
                                 }
                             }
                             .pointerInput(Unit) {
-                                // Separate tap detector for the Double Tap shortcut
-                                // We keep this separate so double-tapping still works quickly
                                 detectTapGestures(onDoubleTap = {
+                                    // WAKE UP
+                                    lastInteractionTime = System.currentTimeMillis()
+                                    fluxState = FluxState.ACTIVE
+
                                     hapticProfile = (hapticProfile + 1) % 3
                                     Toast.makeText(context, "Texture: ${hapticNames[hapticProfile]}", Toast.LENGTH_SHORT).show()
                                 })
@@ -254,19 +354,16 @@ fun OdradekSense() {
                     }
 
                     // B: THE UI LAYER (Foreground)
-                    // Placed AFTER the drawing layer in the code so it renders ON TOP
                     Column(modifier = Modifier.fillMaxSize()) {
-                        // Clock (Centered)
                         val clockColor = when(modeIndex) { 0 -> Color.White; 1 -> Color(0xFFFF5555); 2 -> Color(0xFF00FFFF); 3 -> Color(0xFFFF00FF); else -> Color.White }
+                        // Dim the clock slightly if in Monitor mode to show "Low Power"
+                        val dimming = if (fluxState == FluxState.MONITOR) 0.5f else 1.0f
                         val scale = if (isMotionMode) 1.0f + (motionMagnitude/15f).coerceIn(0f, 0.5f) else 1.0f
 
                         Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                            Text(text = timeText, style = TextStyle(color = clockColor, fontSize = (54 * scale).sp, fontWeight = FontWeight.Thin, shadow = Shadow(color = clockColor, blurRadius = 30f)))
+                            Text(text = timeText, style = TextStyle(color = clockColor.copy(alpha=dimming), fontSize = (54 * scale).sp, fontWeight = FontWeight.Thin, shadow = Shadow(color = clockColor.copy(alpha=dimming), blurRadius = 30f)))
                         }
 
-                        // Menu Button (Bottom)
-                        // Now that the touch layer requires a long press, this button
-                        // will receive standard clicks immediately.
                         Box(modifier = Modifier.padding(bottom = 10.dp).fillMaxWidth(), contentAlignment = Alignment.Center) {
                             CompactChip(
                                 onClick = { isMenuOpen = true },
