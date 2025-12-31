@@ -5,16 +5,21 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.media.*
 import android.os.*
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
@@ -35,7 +40,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumnDefaults
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material.*
 import com.google.android.gms.wearable.Wearable
@@ -43,14 +50,12 @@ import kotlinx.coroutines.*
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import kotlin.math.*
-import androidx.wear.compose.foundation.lazy.ScalingLazyColumnDefaults
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        setContent { MaterialTheme { OdradekSense() } }
+        setContent { MaterialTheme { OdradekSense(this) } }
     }
 }
 
@@ -58,20 +63,29 @@ class MainActivity : ComponentActivity() {
 data class LightPoint(val x: Float, val y: Float, var life: Float = 1.0f, val color: Color)
 
 enum class FluxState {
-    MONITOR, // Low polling (5Hz), No Audio calc, No Haptic logic
-    ACTIVE   // High polling (50Hz), Full Audio/Haptics
+    MONITOR, // Hardware Sleep (Significant Motion Trigger)
+    ACTIVE   // High Performance (Game Delay Polling)
 }
 
+// Wavetable Synthesis Engine
 class SynthEngine {
     private val sampleRate = 44100
     private val buffSize = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
     private var audioTrack: AudioTrack? = null
     private var isRunning = false
+    var isStandby = true 
+    
+    private val tableSize = 4096
+    private val sineTable = FloatArray(tableSize)
+    var frequency = 440.0
+    var amplitude = 0.0
+    private var currentPhase = 0.0
 
-    // Optimization: Standby flag to sleep the thread
-    var isStandby = true
-
-    var frequency = 440.0; var amplitude = 0.0; private var phase = 0.0
+    init {
+        for (i in 0 until tableSize) {
+            sineTable[i] = sin(2.0 * Math.PI * i / tableSize).toFloat()
+        }
+    }
 
     fun start() {
         if (isRunning) return
@@ -83,24 +97,23 @@ class SynthEngine {
             .build()
         audioTrack?.play()
         isRunning = true
-
+        
         Thread {
             val buffer = ShortArray(buffSize / 2)
             while (isRunning) {
-                // BATTERY SAVER: If standby or silent, don't do math.
                 if (isStandby || amplitude <= 0.01) {
                     buffer.fill(0)
-                    // Sleep thread briefly to save CPU cycles
                     try { Thread.sleep(50) } catch (e: Exception) {}
                     try { audioTrack?.write(buffer, 0, buffer.size) } catch (e: Exception) {}
                 } else {
-                    // FLUX MODE: Full Synthesis
+                    val phaseIncrement = frequency / sampleRate
                     for (i in buffer.indices) {
-                        val angle = 2.0 * Math.PI * frequency * (phase / sampleRate)
-                        val sample = (sin(angle) * (amplitude * Short.MAX_VALUE)).toInt().toShort()
-                        buffer[i] = sample; phase++
+                        val tableIndex = (currentPhase * tableSize).toInt() % tableSize
+                        val rawSample = sineTable[tableIndex]
+                        buffer[i] = (rawSample * (amplitude * Short.MAX_VALUE)).toInt().toShort()
+                        currentPhase += phaseIncrement
+                        if (currentPhase >= 1.0) currentPhase -= 1.0
                     }
-                    if (phase > sampleRate) phase -= sampleRate
                     try { audioTrack?.write(buffer, 0, buffer.size) } catch (e: Exception) {}
                 }
             }
@@ -111,7 +124,7 @@ class SynthEngine {
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
-fun OdradekSense() {
+fun OdradekSense(activity: ComponentActivity) {
     val context = LocalContext.current
     val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     val coroutineScope = rememberCoroutineScope()
@@ -125,6 +138,7 @@ fun OdradekSense() {
     // 0=Touch, 1=Motion, 2=Touch+Snd, 3=Motion+Snd
     var modeIndex by remember { mutableIntStateOf(0) }
     var isMenuOpen by remember { mutableStateOf(false) }
+    var showExitDialog by remember { mutableStateOf(false) }
 
     val isMotionMode = (modeIndex == 1 || modeIndex == 3)
     val isSoundEnabled = (modeIndex == 2 || modeIndex == 3)
@@ -141,96 +155,123 @@ fun OdradekSense() {
     var fluxState by remember { mutableStateOf(FluxState.MONITOR) }
     var lastInteractionTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
+    // Screen Curtain
+    val shouldDarken = isMotionMode && fluxState == FluxState.ACTIVE && !isTouching && !isMenuOpen && !showExitDialog
+    val curtainAlpha by animateFloatAsState(
+        targetValue = if (shouldDarken) 1f else 0f,
+        animationSpec = tween(durationMillis = 2000)
+    )
+
     // Audio & Haptics
     val synth = remember { SynthEngine() }
     val vibrator = remember { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
-
-    // DAMPENING VARIABLES
     var scrollAccumulator by remember { mutableFloatStateOf(0f) }
-    val scrollThreshold = 60f // Pixels of rotation needed to switch mode
+    val scrollThreshold = 60f 
+
+    BackHandler(enabled = !showExitDialog) { showExitDialog = true }
 
     DisposableEffect(Unit) { synth.start(); onDispose { synth.stop() } }
 
-    // --- DYNAMIC SENSOR LOOP ---
-    // Re-registers listener when FluxState changes to adjust polling rate
+    // --- HARDWARE SENSOR SWAPPING ---
+    // Optimization 3: Use TYPE_SIGNIFICANT_MOTION to wake CPU instead of polling
+    
+    // We create a persistent reference to the listener logic
+    val triggerListener = remember {
+        object : TriggerEventListener() {
+            override fun onTrigger(event: TriggerEvent?) {
+                // HARDWARE INTERRUPT RECEIVED
+                // Switch to active mode immediately
+                lastInteractionTime = System.currentTimeMillis()
+                fluxState = FluxState.ACTIVE
+            }
+        }
+    }
+
     DisposableEffect(isMotionMode, fluxState) {
         if (isMotionMode) {
-            val listener = object : SensorEventListener {
-                override fun onSensorChanged(event: SensorEvent?) {
-                    event?.let {
+            val linearAccel = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+            val sigMotion = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
+
+            // Listener for Active Mode
+            val accelListener = object : SensorEventListener {
+                override fun onSensorChanged(event: SensorEvent?) { 
+                    event?.let { 
                         val mag = sqrt(it.values[0].pow(2) + it.values[1].pow(2) + it.values[2].pow(2))
-
-                        // Wake up logic
-                        if (mag > 1.2f) {
-                            lastInteractionTime = System.currentTimeMillis()
-                        }
-
-                        motionMagnitude = (motionMagnitude * 0.8f) + (mag * 0.2f)
-                    }
+                        if (mag > 1.2f) { lastInteractionTime = System.currentTimeMillis() }
+                        motionMagnitude = (motionMagnitude * 0.8f) + (mag * 0.2f) 
+                    } 
                 }
                 override fun onAccuracyChanged(s: Sensor?, a: Int) {}
             }
-            val sensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
 
-            // Critical Optimization: SENSOR_DELAY_GAME (20ms) vs SENSOR_DELAY_NORMAL (200ms)
-            val delayType = if (fluxState == FluxState.ACTIVE) SensorManager.SENSOR_DELAY_GAME else SensorManager.SENSOR_DELAY_NORMAL
-
-            sensorManager.registerListener(listener, sensor, delayType)
-            onDispose { sensorManager.unregisterListener(listener) }
+            if (fluxState == FluxState.ACTIVE) {
+                // High Perf: Register Accelerometer
+                sensorManager.registerListener(accelListener, linearAccel, SensorManager.SENSOR_DELAY_GAME)
+                // Ensure trigger is cancelled so we don't double-register
+                if (sigMotion != null) sensorManager.cancelTriggerSensor(triggerListener, sigMotion)
+            } else {
+                // Low Power: Register Hardware Trigger
+                if (sigMotion != null) {
+                    sensorManager.requestTriggerSensor(triggerListener, sigMotion)
+                } else {
+                    // Fallback for older devices: Slow Polling
+                    sensorManager.registerListener(accelListener, linearAccel, SensorManager.SENSOR_DELAY_NORMAL)
+                }
+            }
+            
+            onDispose { 
+                sensorManager.unregisterListener(accelListener)
+                if (sigMotion != null) sensorManager.cancelTriggerSensor(triggerListener, sigMotion)
+            }
         } else { onDispose { } }
     }
 
     // --- STATE MANAGEMENT LOOP ---
-    // Checks every 500ms to see if we should hibernate or wake up
     LaunchedEffect(Unit) {
         while(isActive) {
             val now = System.currentTimeMillis()
             val timeSinceInteraction = now - lastInteractionTime
 
             if (fluxState == FluxState.ACTIVE) {
-                // If inactive for 5 seconds, drop to Monitor
                 if (timeSinceInteraction > 5000) {
                     fluxState = FluxState.MONITOR
-                    motionMagnitude = 0f // Clamp down
+                    motionMagnitude = 0f 
                 }
             } else {
-                // In Monitor mode, if interaction happened recently (via sensor or touch), wake up
-                if (timeSinceInteraction < 200) {
-                    fluxState = FluxState.ACTIVE
-                }
+                // In MONITOR mode (SigMotion), we don't need to poll timeSinceInteraction 
+                // because the TriggerListener will flip the state.
+                // However, we handle the fallback case or touch wake-ups here.
+                if (timeSinceInteraction < 200) { fluxState = FluxState.ACTIVE }
             }
-
-            // Sync Synth State
+            
             synth.isStandby = (fluxState == FluxState.MONITOR)
-
             delay(500)
         }
     }
 
     LaunchedEffect(Unit) { while (true) { timeText = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")); delay(1000) } }
-
-    // VISUAL LOOP
-    LaunchedEffect(Unit) {
-        while (true) {
-            withFrameNanos {
-                if (points.isNotEmpty()) {
-                    val i = points.iterator();
-                    while(i.hasNext()) { val p=i.next(); p.life-=0.02f; if(p.life<=0f) i.remove() }
+    
+    // VISUAL LOOP (Culling Enabled)
+    LaunchedEffect(Unit) { 
+        while (true) { 
+            withFrameNanos { 
+                if (curtainAlpha < 1.0f && points.isNotEmpty()) {
+                    val i = points.iterator(); 
+                    while(i.hasNext()) { val p=i.next(); p.life-=0.02f; if(p.life<=0f) i.remove() } 
                 }
-            }
-        }
+            } 
+        } 
     }
 
-    // --- FEEDBACK LOOP ---
+    // --- FEEDBACK LOOP (Optimized Haptics) ---
     LaunchedEffect(modeIndex, hapticProfile, isTouching, fluxState) {
         var lastNetworkSend = 0L
         while (isActive) {
-            // BATTERY GATE: If monitoring, skip heavy logic loop
             if (fluxState == FluxState.MONITOR && !isTouching) {
                 delay(200)
                 continue
             }
-
+            
             var intensity = 0f
             if (isMotionMode) { intensity = (motionMagnitude / 8.0f).coerceIn(0f, 1f); if (intensity < 0.05f) intensity = 0f }
             else if (isTouching) { intensity = touchIntensity }
@@ -253,11 +294,39 @@ fun OdradekSense() {
                 when (hapticProfile) { 0 -> synth.frequency = 200.0+(intensity*600.0); 1 -> synth.frequency = 1200.0; 2 -> synth.frequency = 60.0+(intensity*40.0) }
             } else { synth.amplitude = 0.0 }
 
+            // Optimization 4: Haptic Debouncing / Motor Safety
+            // Increased minimum delays to 40ms to allow motor spin-down
             if (intensity > 0f) {
                 when (hapticProfile) {
-                    0 -> { if (vibrator.hasAmplitudeControl()) { val amp = (intensity * 255).toInt().coerceAtLeast(10); vibrator.vibrate(VibrationEffect.createOneShot(30, amp)); delay(20) } else { vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)); delay(50) } }
-                    1 -> { val delayTime = (10 + ((1.0f - intensity).pow(2)) * 400).toLong(); vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK)); if (isSoundEnabled) { synth.amplitude = 0.8; delay(20); synth.amplitude = 0.0; delay(delayTime - 20) } else { delay(delayTime) } }
-                    2 -> { if (intensity > 0.4f) { val beatDelay = (600 - (intensity * 400)).toLong(); vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK)); if(isSoundEnabled) { synth.amplitude = 0.8; delay(100); synth.amplitude = 0.0; delay(beatDelay - 100) } else { delay(beatDelay) } } else { delay(100) } }
+                    0 -> { 
+                        if (vibrator.hasAmplitudeControl()) { 
+                            val amp = (intensity * 255).toInt().coerceAtLeast(10)
+                            vibrator.vibrate(VibrationEffect.createOneShot(30, amp))
+                            delay(40) // Increased from 20 to 40
+                        } else { 
+                            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                            delay(60) 
+                        } 
+                    }
+                    1 -> { 
+                        // Modified Geiger formula to never drop below 50ms
+                        val delayTime = (40 + ((1.0f - intensity).pow(2)) * 400).toLong()
+                        vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
+                        if (isSoundEnabled) { 
+                            synth.amplitude = 0.8; delay(20); synth.amplitude = 0.0
+                            delay(delayTime - 20) 
+                        } else { delay(delayTime) } 
+                    }
+                    2 -> { 
+                        if (intensity > 0.4f) { 
+                            val beatDelay = (600 - (intensity * 400)).toLong()
+                            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK))
+                            if(isSoundEnabled) { 
+                                synth.amplitude = 0.8; delay(100); synth.amplitude = 0.0
+                                delay(beatDelay - 100) 
+                            } else { delay(beatDelay) } 
+                        } else { delay(100) } 
+                    }
                 }
             } else { synth.amplitude = 0.0; delay(50) }
         }
@@ -267,25 +336,20 @@ fun OdradekSense() {
     BoxWithConstraints(
         modifier = Modifier.fillMaxSize().background(Color.Black)
     ) {
-        // Capture Screen Width for touch logic
         val screenWidthPx = with(density) { maxWidth.toPx() }
         val screenCenter = screenWidthPx / 2f
 
-        // Outer Box handles Rotary events
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .onRotaryScrollEvent {
-                    if (!isMenuOpen) {
+                    if (!isMenuOpen && !showExitDialog) {
                         scrollAccumulator += it.verticalScrollPixels
                         if (abs(scrollAccumulator) > scrollThreshold) {
                             val direction = if (scrollAccumulator > 0) 1 else -1
                             vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
-
-                            // Interaction here wakes up the engine too
-                            lastInteractionTime = System.currentTimeMillis()
+                            lastInteractionTime = System.currentTimeMillis() 
                             fluxState = FluxState.ACTIVE
-
                             var newIndex = modeIndex + direction
                             if (newIndex > 3) newIndex = 0; if (newIndex < 0) newIndex = 3
                             modeIndex = newIndex
@@ -300,31 +364,25 @@ fun OdradekSense() {
             LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
             // 1. VISUALIZER
-            if (!isMenuOpen) {
+            if (!isMenuOpen && curtainAlpha < 1.0f) {
                 Box(modifier = Modifier.fillMaxSize()) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .pointerInput(Unit) {
-                                if (!isMotionMode && !isMenuOpen) {
+                                if (!isMotionMode && !isMenuOpen && !showExitDialog) {
                                     detectDragGesturesAfterLongPress(
                                         onDragStart = { offset ->
                                             vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
                                             isTouching = true
-
-                                            // WAKE UP
                                             lastInteractionTime = System.currentTimeMillis()
                                             fluxState = FluxState.ACTIVE
-
                                             points.add(LightPoint(offset.x, offset.y, 1.0f, neonColors[colorIndex]))
                                         },
                                         onDrag = { change, _ ->
                                             isTouching = true
-
-                                            // KEEP AWAKE
                                             lastInteractionTime = System.currentTimeMillis()
                                             fluxState = FluxState.ACTIVE
-
                                             points.add(LightPoint(change.position.x, change.position.y, 1.0f, neonColors[colorIndex]))
                                             val d = sqrt((change.position.x - screenCenter).pow(2) + (change.position.y - screenCenter).pow(2))
                                             touchIntensity = 1.0f - (d / screenCenter).coerceIn(0f, 1f)
@@ -336,10 +394,8 @@ fun OdradekSense() {
                             }
                             .pointerInput(Unit) {
                                 detectTapGestures(onDoubleTap = {
-                                    // WAKE UP
                                     lastInteractionTime = System.currentTimeMillis()
                                     fluxState = FluxState.ACTIVE
-
                                     hapticProfile = (hapticProfile + 1) % 3
                                     Toast.makeText(context, "Texture: ${hapticNames[hapticProfile]}", Toast.LENGTH_SHORT).show()
                                 })
@@ -353,10 +409,8 @@ fun OdradekSense() {
                         }
                     }
 
-                    // B: THE UI LAYER (Foreground)
                     Column(modifier = Modifier.fillMaxSize()) {
                         val clockColor = when(modeIndex) { 0 -> Color.White; 1 -> Color(0xFFFF5555); 2 -> Color(0xFF00FFFF); 3 -> Color(0xFFFF00FF); else -> Color.White }
-                        // Dim the clock slightly if in Monitor mode to show "Low Power"
                         val dimming = if (fluxState == FluxState.MONITOR) 0.5f else 1.0f
                         val scale = if (isMotionMode) 1.0f + (motionMagnitude/15f).coerceIn(0f, 0.5f) else 1.0f
 
@@ -375,32 +429,69 @@ fun OdradekSense() {
                 }
             }
 
-            // 2. MENU OVERLAY
+            // 2. BLACKOUT CURTAIN
+            if (curtainAlpha > 0f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(100f)
+                        .background(Color.Black.copy(alpha = curtainAlpha))
+                        .pointerInput(Unit) {
+                            detectTapGestures(onTap = {
+                                lastInteractionTime = System.currentTimeMillis()
+                                fluxState = FluxState.ACTIVE
+                            })
+                        }
+                )
+            }
+
+            // 3. MENU OVERLAY
             if (isMenuOpen) {
                 val listState = rememberScalingLazyListState()
                 LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
                 ScalingLazyColumn(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color.Black.copy(alpha=0.95f))
-                        .onRotaryScrollEvent {
-                            coroutineScope.launch { listState.scrollBy(it.verticalScrollPixels) }
-                            true
-                        },
+                    modifier = Modifier.fillMaxSize().zIndex(200f).background(Color.Black.copy(alpha=0.95f)).onRotaryScrollEvent { coroutineScope.launch { listState.scrollBy(it.verticalScrollPixels) }; true },
                     state = listState,
-                    scalingParams = ScalingLazyColumnDefaults.scalingParams(edgeScale = 0.5f, edgeAlpha = 0.5f)                ) {
+                    scalingParams = ScalingLazyColumnDefaults.scalingParams(edgeScale = 0.5f, edgeAlpha = 0.5f)                
+                ) {
                     item { Text("ODRADEK MODE", color = Color.LightGray, fontSize = 12.sp, modifier = Modifier.padding(bottom=5.dp)) }
                     item { ModeChip("Touch (Silent)", 0, modeIndex) { modeIndex = 0; isMenuOpen = false } }
                     item { ModeChip("Motion (Silent)", 1, modeIndex) { modeIndex = 1; isMenuOpen = false } }
                     item { ModeChip("Touch + Audio", 2, modeIndex) { modeIndex = 2; isMenuOpen = false } }
                     item { ModeChip("Motion + Audio", 3, modeIndex) { modeIndex = 3; isMenuOpen = false } }
                     item {
-                        Button(
-                            onClick = { isMenuOpen = false },
-                            colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray),
-                            modifier = Modifier.padding(top=10.dp).size(40.dp)
-                        ) { Text("X") }
+                        Button(onClick = { isMenuOpen = false }, colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray), modifier = Modifier.padding(top=10.dp).size(40.dp)) { Text("X") }
+                    }
+                }
+            }
+            
+            // 4. AIRLOCK (EXIT DIALOG)
+            if (showExitDialog) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(300f)
+                        .background(Color.Black.copy(alpha=0.9f))
+                        .pointerInput(Unit) { detectTapGestures {} },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text("POWER DOWN?", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.padding(bottom=15.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            CompactButton(
+                                onClick = { showExitDialog = false },
+                                colors = ButtonDefaults.secondaryButtonColors()
+                            ) { Text("NO") }
+                            
+                            CompactButton(
+                                onClick = { activity.finish() },
+                                colors = ButtonDefaults.primaryButtonColors(backgroundColor = Color(0xFFFF5555))
+                            ) { Text("OFF") }
+                        }
                     }
                 }
             }
