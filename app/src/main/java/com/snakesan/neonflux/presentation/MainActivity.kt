@@ -1,13 +1,8 @@
 package com.snakesan.neonflux
 
+import android.app.Activity
 import android.content.Context
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
-import android.hardware.TriggerEvent
-import android.hardware.TriggerEventListener
-import android.media.*
+import android.content.SharedPreferences
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -16,461 +11,524 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import android.view.WindowManager
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CutCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
-import androidx.wear.compose.foundation.lazy.ScalingLazyColumnDefaults
-import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material.*
+import com.google.android.gms.wearable.MessageClient
+import com.google.android.gms.wearable.MessageEvent
+import com.google.android.gms.wearable.Node
 import com.google.android.gms.wearable.Wearable
 import kotlinx.coroutines.*
-import java.time.LocalTime
-import java.time.format.DateTimeFormatter
+import java.nio.ByteBuffer
 import kotlin.math.*
+import kotlin.random.Random
 
-class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        setContent { MaterialTheme { OdradekSense(this) } }
+// --- ENUMS ---
+enum class FluxState { MONITOR, ACTIVE }
+enum class Deck { REACTOR, CLINICAL }
+
+// --- THEME CONSTANTS ---
+val FluxCyan = Color(0xFF00F3FF)
+val FluxPink = Color(0xFFFF0055)
+val FluxDark = Color(0xFF121212)
+val FluxBg = Color(0xFF050505)
+
+// --- LOGGING HELPER ---
+fun logPulse(mode: Int, intensity: Int) {
+    Log.d("NEON_PWR", "${System.currentTimeMillis()},99,$mode,$intensity,0,0")
+}
+
+// --- SHARED VIBRATION HELPER (Top Level) ---
+fun vibrateAck(context: Context) {
+    val v = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+    } else {
+        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+    }
+    
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        v.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK))
+    } else {
+        v.vibrate(100)
     }
 }
 
-data class LightPoint(val x: Float, val y: Float, var life: Float = 1.0f, val color: Color)
+// Overload for when we already have the vibrator instance (for loop performance)
+fun vibrateAck(v: Vibrator) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        v.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK))
+    } else {
+        v.vibrate(100)
+    }
+}
 
-enum class FluxState { MONITOR, ACTIVE }
+class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListener {
 
-// --- OPTIMIZATION: THE BITCRUSHER SYNTH ---
-class SynthEngine {
-    // CHANGE 1: Drop Sample Rate to 11025Hz (Low-Fi)
-    // This reduces CPU load by 75% compared to 44100Hz
-    private val sampleRate = 11025 
+    private lateinit var prefs: SharedPreferences
+
+    // Clinical Config (Persistent)
+    var clinicalProfile by mutableIntStateOf(0)
+    var clinicalBpm by mutableIntStateOf(60)
+    var clinicalIntensity by mutableIntStateOf(50)
+    var clinicalSleep by mutableStateOf(false)
+
+    // Reactor Profile (Persistent)
+    var reactorProfile by mutableIntStateOf(0)
     
-    private val buffSize = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-    private var audioTrack: AudioTrack? = null
-    private var isRunning = false
-    var isStandby = true 
-    
-    private val tableSize = 4096
-    private val sineTable = FloatArray(tableSize)
-    var frequency = 440.0
-    var amplitude = 0.0
-    private var currentPhase = 0.0
+    // VISUAL STATE: Triggered by incoming messages
+    var isSyncing by mutableStateOf(false)
 
-    init {
-        // Pre-calculate sine table
-        for (i in 0 until tableSize) {
-            sineTable[i] = sin(2.0 * Math.PI * i / tableSize).toFloat()
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        prefs = getSharedPreferences("FluxWatchConfig", Context.MODE_PRIVATE)
+        
+        // Restore State
+        clinicalProfile = prefs.getInt("profile", 0)
+        clinicalBpm = prefs.getInt("bpm", 60)
+        clinicalIntensity = prefs.getInt("intensity", 50)
+        clinicalSleep = prefs.getBoolean("sleep", false)
+        reactorProfile = prefs.getInt("reactor_profile", 0)
+
+        Wearable.getMessageClient(this).addListener(this)
+        setContent { MaterialTheme { OdradekSense(this) } }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Wearable.getMessageClient(this).removeListener(this)
+    }
+
+    fun saveReactorProfile(profile: Int) {
+        reactorProfile = profile
+        prefs.edit().putInt("reactor_profile", profile).apply()
+    }
+
+    override fun onMessageReceived(event: MessageEvent) {
+        if (event.path == "/clinical_conf") {
+            try {
+                val buffer = ByteBuffer.wrap(event.data)
+                clinicalProfile = buffer.get().toInt()
+                clinicalBpm = buffer.getInt()
+                clinicalIntensity = buffer.get().toInt()
+                clinicalSleep = buffer.get().toInt() == 1
+                
+                prefs.edit().apply {
+                    putInt("profile", clinicalProfile)
+                    putInt("bpm", clinicalBpm)
+                    putInt("intensity", clinicalIntensity)
+                    putBoolean("sleep", clinicalSleep)
+                    apply()
+                }
+
+                // 1. Acknowledge reception physically
+                vibrateAck(this)
+                
+                // 2. Trigger Visual Sync Sequence (Handled in Compose)
+                isSyncing = true
+                
+            } catch (e: Exception) { Log.e("Flux", "Config Error", e) }
         }
     }
+}
 
-    fun start() {
-        if (isRunning) return
-        audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-            .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-            .setBufferSizeInBytes(buffSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-        audioTrack?.play()
-        isRunning = true
-        
-        Thread {
-            val buffer = ShortArray(buffSize) // Use full buffer size
-            while (isRunning) {
-                if (isStandby || amplitude <= 0.01) {
-                    buffer.fill(0)
-                    // Sleep longer in standby (100ms)
-                    try { Thread.sleep(100) } catch (e: Exception) {}
-                    try { audioTrack?.write(buffer, 0, buffer.size) } catch (e: Exception) {}
-                } else {
-                    val phaseIncrement = frequency / sampleRate
-                    
-                    // Unroll loop slightly for speed (optional, but good practice)
-                    for (i in buffer.indices) {
-                        val tableIndex = (currentPhase * tableSize).toInt() % tableSize
-                        val rawSample = sineTable[tableIndex]
-                        buffer[i] = (rawSample * (amplitude * Short.MAX_VALUE)).toInt().toShort()
-                        currentPhase += phaseIncrement
-                        if (currentPhase >= 1.0) currentPhase -= 1.0
-                    }
-                    // Blocking write - this naturally paces the thread to the sample rate
-                    try { audioTrack?.write(buffer, 0, buffer.size) } catch (e: Exception) {}
-                }
-            }
-        }.start()
+class SynthEngine {
+    init { try { System.loadLibrary("neonflux") } catch (e: Exception) {} }
+    
+    var frequency = 440.0
+    var amplitude = 0.0
+    var isStandby = true 
+
+    private external fun startNative()
+    private external fun stopNative()
+    private external fun updateNative(freq: Float, amp: Float)
+    private external fun setVolumeNative(vol: Float)
+    private external fun pauseSensorsNative(paused: Boolean)
+    external fun getSensorMagnitude(): Float 
+    
+    fun start() { startNative(); pauseSensorsNative(false) }
+    fun stop() { stopNative() }
+    
+    fun update() {
+        val targetAmp = if (isStandby) 0.0f else amplitude.toFloat()
+        updateNative(frequency.toFloat(), targetAmp)
     }
-    fun stop() { isRunning = false; try { audioTrack?.stop(); audioTrack?.release() } catch (e: Exception) {} }
+    
+    fun setVolume(vol: Float) { setVolumeNative(vol) }
+}
+
+// --- UI COMPONENTS ---
+
+@Composable
+fun FluxButton(text: String, onClick: () -> Unit, color: Color = FluxCyan, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .height(35.dp)
+            .clip(CutCornerShape(topStart = 8.dp, bottomEnd = 8.dp))
+            .background(color.copy(alpha = 0.2f))
+            .border(1.dp, color.copy(alpha = 0.5f), CutCornerShape(topStart = 8.dp, bottomEnd = 8.dp))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text = text, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 12.dp))
+    }
+}
+
+@Composable
+fun FluxLabel(title: String, value: String, color: Color = Color.White) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(title, color = Color.Gray, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+        Text(value, color = color, fontSize = 16.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+    }
 }
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
-fun OdradekSense(activity: ComponentActivity) {
+fun OdradekSense(activity: MainActivity) {
     val context = LocalContext.current
-    val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    val coroutineScope = rememberCoroutineScope()
     val focusRequester = remember { FocusRequester() }
-    val density = LocalDensity.current
+    val vibrator = remember { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
 
-    var timeText by remember { mutableStateOf("") }
-    val points = remember { mutableStateListOf<LightPoint>() }
-    var modeIndex by remember { mutableIntStateOf(0) }
-    var isMenuOpen by remember { mutableStateOf(false) }
+    var currentDeck by remember { mutableStateOf(Deck.REACTOR) }
     var showExitDialog by remember { mutableStateOf(false) }
+    var profileNameToast by remember { mutableStateOf("") }
+    
+    var batteryLevel by remember { mutableIntStateOf(100) }
+    var timeRemaining by remember { mutableStateOf("CALC...") }
 
-    val isMotionMode = (modeIndex == 1 || modeIndex == 3)
-    val isSoundEnabled = (modeIndex == 2 || modeIndex == 3)
-
+    var isAudioMode by remember { mutableStateOf(false) }
     var motionMagnitude by remember { mutableFloatStateOf(0f) }
-    var touchIntensity by remember { mutableFloatStateOf(0f) }
-    var isTouching by remember { mutableStateOf(false) }
-    var hapticProfile by remember { mutableIntStateOf(0) }
-    var colorIndex by remember { mutableIntStateOf(0) }
-    val neonColors = listOf(Color(0xFF00FFCC), Color(0xFFD400FF), Color(0xFFCCFF00))
-    val hapticNames = listOf("Dynamo", "Geiger", "Throb")
-
     var fluxState by remember { mutableStateOf(FluxState.MONITOR) }
+    
+    var isClinicalActive by remember { mutableStateOf(false) }
+    var countdownValue by remember { mutableIntStateOf(0) }
+    
     var lastInteractionTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
-
-    val shouldDarken = isMotionMode && fluxState == FluxState.ACTIVE && !isTouching && !isMenuOpen && !showExitDialog
-    val curtainAlpha by animateFloatAsState(
-        targetValue = if (shouldDarken) 1f else 0f,
-        animationSpec = tween(durationMillis = 2000)
-    )
+    var scrollAccumulator by remember { mutableFloatStateOf(0f) }
 
     val synth = remember { SynthEngine() }
-    val vibrator = remember { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
-    var scrollAccumulator by remember { mutableFloatStateOf(0f) }
-    val scrollThreshold = 60f 
-
-    BackHandler(enabled = !showExitDialog) { showExitDialog = true }
-
-    DisposableEffect(Unit) { synth.start(); onDispose { synth.stop() } }
-
-    // --- TELEMETRY ---
-    LaunchedEffect(Unit) {
-        val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
-        Log.d("NEON_PWR", "Time,State,Mode,ScreenAlpha,Motion,MicroAmps")
-        if (batteryManager != null) {
-            while(isActive) {
-                val microAmps = abs(batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW))
-                val stateInt = if (fluxState == FluxState.ACTIVE) 1 else 0
-                val screenVisibility = "%.2f".format(1f - curtainAlpha)
-                val motionFmt = "%.2f".format(motionMagnitude)
-                val time = System.currentTimeMillis()
-                Log.d("NEON_PWR", "$time,$stateInt,$modeIndex,$screenVisibility,$motionFmt,$microAmps")
-                delay(1000)
-            }
-        }
-    }
-
-    // --- SENSORS ---
-    val triggerListener = remember {
-        object : TriggerEventListener() {
-            override fun onTrigger(event: TriggerEvent?) {
-                lastInteractionTime = System.currentTimeMillis()
-                fluxState = FluxState.ACTIVE
-            }
-        }
-    }
-
-    DisposableEffect(isMotionMode, fluxState) {
-        if (isMotionMode) {
-            val linearAccel = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
-            val sigMotion = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
-            val accelListener = object : SensorEventListener {
-                override fun onSensorChanged(event: SensorEvent?) { 
-                    event?.let { 
-                        val mag = sqrt(it.values[0].pow(2) + it.values[1].pow(2) + it.values[2].pow(2))
-                        if (mag > 1.2f) { lastInteractionTime = System.currentTimeMillis() }
-                        motionMagnitude = (motionMagnitude * 0.8f) + (mag * 0.2f) 
-                    } 
-                }
-                override fun onAccuracyChanged(s: Sensor?, a: Int) {}
-            }
-            if (fluxState == FluxState.ACTIVE) {
-                if (linearAccel != null) sensorManager.registerListener(accelListener, linearAccel, SensorManager.SENSOR_DELAY_GAME)
-                if (sigMotion != null) sensorManager.cancelTriggerSensor(triggerListener, sigMotion)
-            } else {
-                if (sigMotion != null) {
-                    sensorManager.requestTriggerSensor(triggerListener, sigMotion)
-                } else {
-                    if (linearAccel != null) sensorManager.registerListener(accelListener, linearAccel, SensorManager.SENSOR_DELAY_NORMAL)
-                }
-            }
-            onDispose { 
-                sensorManager.unregisterListener(accelListener)
-                if (sigMotion != null) sensorManager.cancelTriggerSensor(triggerListener, sigMotion)
-            }
-        } else { onDispose { } }
-    }
-
-    // --- STATE LOOP ---
+    
+    // Caching & Power Optimizations
+    var cachedNodes by remember { mutableStateOf<List<Node>>(emptyList()) }
     LaunchedEffect(Unit) {
         while(isActive) {
-            val now = System.currentTimeMillis()
-            val timeSinceInteraction = now - lastInteractionTime
+            Wearable.getNodeClient(context).connectedNodes.addOnSuccessListener { cachedNodes = it }
+            delay(10000) 
+        }
+    }
+
+    val isActiveSession = (fluxState == FluxState.ACTIVE) || isClinicalActive
+    val window = (context as? Activity)?.window
+    DisposableEffect(isActiveSession) {
+        if (window != null) {
+            if (isActiveSession) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
+
+    // Slow Logger
+    LaunchedEffect(isClinicalActive, isAudioMode, fluxState) {
+        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        Log.d("NEON_PWR", "Time,State,Mode,MicroAmps,Voltage,Level")
+        while(isActive) {
+            val lvl = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            val ua = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+            batteryLevel = lvl
+            Log.d("NEON_PWR", "${System.currentTimeMillis()},0,0,$ua,0,$lvl")
+            val burnRate = if(isClinicalActive) 0.3 else if (isAudioMode) 0.8 else 0.5 
+            val minsLeft = (lvl / burnRate).toInt()
+            timeRemaining = "${minsLeft / 60}h ${minsLeft % 60}m"
+            delay(5000)
+        }
+    }
+
+    // Toast Timer
+    LaunchedEffect(profileNameToast) {
+        if (profileNameToast.isNotEmpty()) { delay(1500); profileNameToast = "" }
+    }
+
+    val isLockedDown = isClinicalActive && countdownValue == 0
+    val shouldDarken = isLockedDown || (fluxState == FluxState.ACTIVE && currentDeck == Deck.REACTOR && !showExitDialog)
+    val curtainAlpha by animateFloatAsState(targetValue = if (shouldDarken) 1f else 0f, animationSpec = tween(800))
+
+    BackHandler(enabled = !showExitDialog && !isLockedDown) { showExitDialog = true }
+
+    // Engine Lifecycle
+    val sensorsEnabled = (currentDeck == Deck.REACTOR && !isClinicalActive)
+    DisposableEffect(sensorsEnabled) {
+        if (sensorsEnabled) synth.start() else synth.stop()
+        onDispose { synth.stop() }
+    }
+
+    // REACTOR LOOP
+    LaunchedEffect(sensorsEnabled, fluxState, isAudioMode, activity.reactorProfile) {
+        var lastNetSend = 0L
+        synth.isStandby = true; synth.update()
+
+        while(isActive && sensorsEnabled) {
+            val rawMag = synth.getSensorMagnitude()
+            if (rawMag > 1.2f) { lastInteractionTime = System.currentTimeMillis(); fluxState = FluxState.ACTIVE }
+            motionMagnitude = rawMag
+
             if (fluxState == FluxState.ACTIVE) {
-                if (timeSinceInteraction > 5000) {
-                    fluxState = FluxState.MONITOR
-                    motionMagnitude = 0f 
+                if (System.currentTimeMillis() - lastInteractionTime > 5000) fluxState = FluxState.MONITOR
+                val intensity = (motionMagnitude / 8.0f).coerceIn(0f, 1f)
+
+                if (isAudioMode) { synth.amplitude = 0.2 + (intensity * 0.6); synth.isStandby = false } 
+                else { synth.isStandby = true }
+                synth.update()
+
+                val now = System.currentTimeMillis()
+                if (now - lastNetSend > 50 && intensity > 0f) {
+                    lastNetSend = now
+                    if (cachedNodes.isNotEmpty()) {
+                        val modeByte = if (isAudioMode) 3.toByte() else 1.toByte()
+                        val intensityByte = (intensity * 100).toInt().toByte()
+                        val payload = byteArrayOf(modeByte, 0, intensityByte)
+                        cachedNodes.forEach { node -> Wearable.getMessageClient(context).sendMessage(node.id, "/flux_sync", payload) }
+                    }
                 }
+
+                if (intensity > 0.05f) {
+                    when (activity.reactorProfile) {
+                        0 -> { 
+                            delay(60); val amp = (intensity * 200).toInt().coerceAtLeast(10)
+                            if (vibrator.hasAmplitudeControl()) vibrator.vibrate(VibrationEffect.createOneShot(30, amp))
+                            else vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                        }
+                        1 -> { 
+                            if (Random.nextFloat() < (intensity * 0.45f)) { vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)); delay(40) } 
+                            else delay(30)
+                        }
+                        2 -> {
+                            delay(60); val heavyInt = (intensity * 1.5f).coerceAtMost(1f)
+                            val amp = (heavyInt * 255).toInt().coerceAtLeast(20)
+                            if (vibrator.hasAmplitudeControl()) vibrator.vibrate(VibrationEffect.createOneShot(80, amp))
+                            else vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK))
+                        }
+                    }
+                    logPulse(1, (intensity * 100).toInt())
+                } else delay(40)
             } else {
-                if (timeSinceInteraction < 200) { fluxState = FluxState.ACTIVE }
+                synth.isStandby = true; synth.update(); delay(100)
             }
-            synth.isStandby = (fluxState == FluxState.MONITOR)
-            delay(500)
         }
     }
 
-    LaunchedEffect(Unit) { while (true) { timeText = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")); delay(1000) } }
-    
-    // --- VISUAL PHYSICS LOOP (OPTIMIZED) ---
-    LaunchedEffect(Unit) { 
-        while (true) { 
-            // CHANGE 2: If the curtain is black, pause the loop entirely.
-            if (curtainAlpha >= 1.0f) {
-                delay(500) // Sleep CPU while screen is dark
-            } else {
-                withFrameNanos { 
-                    if (points.isNotEmpty()) {
-                        val i = points.iterator(); 
-                        while(i.hasNext()) { val p=i.next(); p.life-=0.02f; if(p.life<=0f) i.remove() } 
-                    }
+    // CLINICAL ENGINE
+    LaunchedEffect(isClinicalActive) {
+        if (isClinicalActive) {
+            val syncDelay = 3000L
+            val startTime = System.currentTimeMillis() + syncDelay
+            val buf = ByteBuffer.allocate(15)
+            buf.put(activity.clinicalProfile.toByte()); buf.putInt(activity.clinicalBpm); buf.put(activity.clinicalIntensity.toByte()); buf.put(if(activity.clinicalSleep) 1.toByte() else 0.toByte()); buf.putLong(startTime)
+            Wearable.getNodeClient(context).connectedNodes.addOnSuccessListener { nodes -> nodes.forEach { Wearable.getMessageClient(context).sendMessage(it.id, "/clinical_start", buf.array()) } }
+
+            for (i in 3 downTo 1) { countdownValue = i; vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)); delay(1000) }
+            countdownValue = 0
+
+            val periodMs = 60000.0 / activity.clinicalBpm; var beatCount = 0L
+            while(isActive) {
+                val cInt = activity.clinicalIntensity
+                val cProf = activity.clinicalProfile
+                if (cInt > 0) {
+                    val amp = (cInt / 100f * 255).toInt().coerceAtLeast(10)
+                    if (vibrator.hasAmplitudeControl()) {
+                        when(cProf) {
+                            0 -> vibrator.vibrate(VibrationEffect.createOneShot(50, amp))
+                            1 -> vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
+                            2 -> vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 100), intArrayOf(0, amp), -1))
+                        }
+                    } else vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                    logPulse(2, cInt)
                 }
+                beatCount++
+                val nextBeatTime = startTime + (beatCount * periodMs).toLong()
+                val sleepTime = nextBeatTime - System.currentTimeMillis()
+                if (sleepTime > 0) delay(sleepTime)
             }
-        } 
-    }
-
-    // --- FEEDBACK LOOP ---
-    LaunchedEffect(modeIndex, hapticProfile, isTouching, fluxState) {
-        var lastNetworkSend = 0L
-        while (isActive) {
-            if (fluxState == FluxState.MONITOR && !isTouching) {
-                delay(200)
-                continue
-            }
-            
-            var intensity = 0f
-            if (isMotionMode) { intensity = (motionMagnitude / 8.0f).coerceIn(0f, 1f); if (intensity < 0.05f) intensity = 0f }
-            else if (isTouching) { intensity = touchIntensity }
-
-            val currentTime = System.currentTimeMillis()
-            if (currentTime - lastNetworkSend > 50 && intensity > 0f) {
-                lastNetworkSend = currentTime
-                coroutineScope.launch(Dispatchers.IO) {
-                    try {
-                        val payload = byteArrayOf(modeIndex.toByte(), hapticProfile.toByte(), (intensity * 100).toInt().toByte())
-                        val nodeClient = Wearable.getNodeClient(context); val msgClient = Wearable.getMessageClient(context)
-                        val nodes = com.google.android.gms.tasks.Tasks.await(nodeClient.connectedNodes)
-                        nodes.forEach { node -> msgClient.sendMessage(node.id, "/flux_sync", payload) }
-                    } catch (e: Exception) {}
-                }
-            }
-
-            if (isSoundEnabled && intensity > 0f) {
-                synth.amplitude = 0.5
-                when (hapticProfile) { 0 -> synth.frequency = 200.0+(intensity*600.0); 1 -> synth.frequency = 1200.0; 2 -> synth.frequency = 60.0+(intensity*40.0) }
-            } else { synth.amplitude = 0.0 }
-
-            if (intensity > 0f) {
-                // CHANGE 3: Cap Haptic Intensity to 200/255 (approx 80%) to save battery
-                // Haptic motors are power hungry at 100%
-                when (hapticProfile) {
-                    0 -> { 
-                        if (vibrator.hasAmplitudeControl()) { 
-                            // Cap max amplitude to 200
-                            val amp = (intensity * 200).toInt().coerceAtLeast(10)
-                            vibrator.vibrate(VibrationEffect.createOneShot(30, amp))
-                            delay(40) 
-                        } else { 
-                            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
-                            delay(60) 
-                        } 
-                    }
-                    1 -> { 
-                        val delayTime = (40 + ((1.0f - intensity).pow(2)) * 400).toLong()
-                        vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
-                        if (isSoundEnabled) { 
-                            synth.amplitude = 0.8; delay(20); synth.amplitude = 0.0
-                            delay(delayTime - 20) 
-                        } else { delay(delayTime) } 
-                    }
-                    2 -> { 
-                        if (intensity > 0.4f) { 
-                            val beatDelay = (600 - (intensity * 400)).toLong()
-                            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK))
-                            if(isSoundEnabled) { 
-                                synth.amplitude = 0.8; delay(100); synth.amplitude = 0.0
-                                delay(beatDelay - 100) 
-                            } else { delay(beatDelay) } 
-                        } else { delay(100) } 
-                    }
-                }
-            } else { synth.amplitude = 0.0; delay(50) }
+        } else {
+            Wearable.getNodeClient(context).connectedNodes.addOnSuccessListener { nodes -> nodes.forEach { Wearable.getMessageClient(context).sendMessage(it.id, "/clinical_stop", byteArrayOf()) } }
         }
     }
 
-    BoxWithConstraints(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        val screenWidthPx = with(density) { maxWidth.toPx() }
-        val screenCenter = screenWidthPx / 2f
-
-        Box(
-            modifier = Modifier.fillMaxSize()
-                .onRotaryScrollEvent {
-                    if (!isMenuOpen && !showExitDialog) {
-                        scrollAccumulator += it.verticalScrollPixels
-                        if (abs(scrollAccumulator) > scrollThreshold) {
-                            val direction = if (scrollAccumulator > 0) 1 else -1
-                            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
-                            lastInteractionTime = System.currentTimeMillis() 
-                            fluxState = FluxState.ACTIVE
-                            var newIndex = modeIndex + direction
-                            if (newIndex > 3) newIndex = 0; if (newIndex < 0) newIndex = 3
-                            modeIndex = newIndex
-                            scrollAccumulator = 0f
-                            true
-                        } else { false }
-                    } else { false }
-                }
-                .focusRequester(focusRequester)
-                .focusable()
-        ) {
-            LaunchedEffect(Unit) { focusRequester.requestFocus() }
-
-            if (!isMenuOpen && curtainAlpha < 1.0f) {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    Box(
-                        modifier = Modifier.fillMaxSize()
-                            .pointerInput(Unit) {
-                                if (!isMotionMode && !isMenuOpen && !showExitDialog) {
-                                    detectDragGesturesAfterLongPress(
-                                        onDragStart = { offset ->
-                                            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
-                                            isTouching = true
-                                            lastInteractionTime = System.currentTimeMillis()
-                                            fluxState = FluxState.ACTIVE
-                                            points.add(LightPoint(offset.x, offset.y, 1.0f, neonColors[colorIndex]))
-                                        },
-                                        onDrag = { change, _ ->
-                                            isTouching = true
-                                            lastInteractionTime = System.currentTimeMillis()
-                                            fluxState = FluxState.ACTIVE
-                                            points.add(LightPoint(change.position.x, change.position.y, 1.0f, neonColors[colorIndex]))
-                                            val d = sqrt((change.position.x - screenCenter).pow(2) + (change.position.y - screenCenter).pow(2))
-                                            touchIntensity = 1.0f - (d / screenCenter).coerceIn(0f, 1f)
-                                        },
-                                        onDragEnd = { isTouching = false; colorIndex = (colorIndex + 1) % neonColors.size },
-                                        onDragCancel = { isTouching = false }
-                                    )
-                                }
-                            }
-                            .pointerInput(Unit) {
-                                detectTapGestures(onDoubleTap = {
-                                    lastInteractionTime = System.currentTimeMillis()
-                                    fluxState = FluxState.ACTIVE
-                                    hapticProfile = (hapticProfile + 1) % 3
-                                    Toast.makeText(context, "Texture: ${hapticNames[hapticProfile]}", Toast.LENGTH_SHORT).show()
-                                })
-                            }
-                    ) {
-                        if (!isMotionMode) {
-                            Canvas(modifier = Modifier.fillMaxSize()) {
-                                points.forEach { pt -> drawCircle(color = pt.color.copy(alpha = max(0f, pt.life)), radius = 15.dp.toPx() * pt.life, center = Offset(pt.x, pt.y)) }
-                                drawCircle(Color.DarkGray, radius=10.dp.toPx(), style=androidx.compose.ui.graphics.drawscope.Stroke(2f))
-                            }
-                        }
-                    }
-
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        val clockColor = when(modeIndex) { 0 -> Color.White; 1 -> Color(0xFFFF5555); 2 -> Color(0xFF00FFFF); 3 -> Color(0xFFFF00FF); else -> Color.White }
-                        val dimming = if (fluxState == FluxState.MONITOR) 0.5f else 1.0f
-                        val scale = if (isMotionMode) 1.0f + (motionMagnitude/15f).coerceIn(0f, 0.5f) else 1.0f
-
-                        Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                            Text(text = timeText, style = TextStyle(color = clockColor.copy(alpha=dimming), fontSize = (54 * scale).sp, fontWeight = FontWeight.Thin, shadow = Shadow(color = clockColor.copy(alpha=dimming), blurRadius = 30f)))
-                        }
-
-                        Box(modifier = Modifier.padding(bottom = 10.dp).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                            CompactChip(
-                                onClick = { isMenuOpen = true },
-                                label = { Text(when(modeIndex) { 0->"TOUCH"; 1->"MOTION"; 2->"TOUCH + AUDIO"; 3->"MOTION + AUDIO"; else->"" }, fontSize = 10.sp) },
-                                colors = ChipDefaults.secondaryChipColors()
-                            )
-                        }
-                    }
-                }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(FluxBg)
+            .onRotaryScrollEvent {
+                if (!isLockedDown && !showExitDialog && !activity.isSyncing) { // Lock scrolling during sync
+                    scrollAccumulator += it.verticalScrollPixels
+                    if (abs(scrollAccumulator) > 60f) {
+                        vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                        lastInteractionTime = System.currentTimeMillis()
+                        currentDeck = if (currentDeck == Deck.REACTOR) Deck.CLINICAL else Deck.REACTOR
+                        scrollAccumulator = 0f; true
+                    } else false
+                } else false
             }
-
-            if (curtainAlpha > 0f) {
-                Box(modifier = Modifier.fillMaxSize().zIndex(100f).background(Color.Black.copy(alpha = curtainAlpha))
-                        .pointerInput(Unit) { detectTapGestures(onTap = { lastInteractionTime = System.currentTimeMillis(); fluxState = FluxState.ACTIVE }) }
+            .focusRequester(focusRequester).focusable()
+            .pointerInput(fluxState, isLockedDown, currentDeck) {
+                detectTapGestures(
+                    onDoubleTap = {
+                        if (currentDeck == Deck.REACTOR && !isLockedDown && !activity.isSyncing) {
+                            val next = (activity.reactorProfile + 1) % 3
+                            activity.saveReactorProfile(next)
+                            vibrateAck(vibrator)
+                            profileNameToast = when(next) { 0 -> "PULSE"; 1 -> "GEIGER"; else -> "THROB" }
+                            lastInteractionTime = System.currentTimeMillis(); fluxState = FluxState.ACTIVE
+                        }
+                    },
+                    onTap = { if (!isLockedDown && !activity.isSyncing) { lastInteractionTime = System.currentTimeMillis(); fluxState = FluxState.ACTIVE } }
                 )
             }
+            .pointerInput(isLockedDown) {
+                 if (isLockedDown) {
+                     awaitEachGesture {
+                         val down = awaitFirstDown(requireUnconsumed = false)
+                         val start = System.currentTimeMillis()
+                         var holding = true
+                         do {
+                             val ev = awaitPointerEvent()
+                             if (ev.changes.size < 2 && System.currentTimeMillis() - start > 200) holding = false
+                             if (holding && ev.changes.size >= 2 && System.currentTimeMillis() - start > 3000) {
+                                 isClinicalActive = false; vibrator.vibrate(VibrationEffect.createOneShot(500, 255)); holding = false
+                             }
+                         } while (ev.changes.any { it.pressed } && holding)
+                     }
+                 }
+            }
+    ) {
+        LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
-            if (isMenuOpen) {
-                val listState = rememberScalingLazyListState()
-                LaunchedEffect(Unit) { focusRequester.requestFocus() }
-                ScalingLazyColumn(
-                    modifier = Modifier.fillMaxSize().zIndex(200f).background(Color.Black.copy(alpha=0.95f)).onRotaryScrollEvent { coroutineScope.launch { listState.scrollBy(it.verticalScrollPixels) }; true },
-                    state = listState,
-                    scalingParams = ScalingLazyColumnDefaults.scalingParams(edgeScale = 0.5f, edgeAlpha = 0.5f)                
-                ) {
-                    item { Text("ODRADEK MODE", color = Color.LightGray, fontSize = 12.sp, modifier = Modifier.padding(bottom=5.dp)) }
-                    item { ModeChip("Touch (Silent)", 0, modeIndex) { modeIndex = 0; isMenuOpen = false } }
-                    item { ModeChip("Motion (Silent)", 1, modeIndex) { modeIndex = 1; isMenuOpen = false } }
-                    item { ModeChip("Touch + Audio", 2, modeIndex) { modeIndex = 2; isMenuOpen = false } }
-                    item { ModeChip("Motion + Audio", 3, modeIndex) { modeIndex = 3; isMenuOpen = false } }
-                    item { Button(onClick = { isMenuOpen = false }, colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray), modifier = Modifier.padding(top=10.dp).size(40.dp)) { Text("X") } }
-                }
+        // --- VISUAL SYNC OVERLAY (Highest Z-Index) ---
+        if (activity.isSyncing) {
+            val syncProgress = remember { Animatable(0f) }
+            
+            LaunchedEffect(Unit) {
+                // Match phone duration approx 2.5s
+                syncProgress.animateTo(1f, animationSpec = tween(2500, easing = LinearEasing))
+                delay(200) // Brief hold
+                activity.isSyncing = false
+                currentDeck = Deck.CLINICAL // Auto-switch to show new config
             }
             
-            if (showExitDialog) {
-                Box(modifier = Modifier.fillMaxSize().zIndex(300f).background(Color.Black.copy(alpha=0.9f)).pointerInput(Unit) { detectTapGestures {} }, contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                        Text("POWER DOWN?", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.padding(bottom=15.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            CompactButton(onClick = { showExitDialog = false }, colors = ButtonDefaults.secondaryButtonColors()) { Text("NO") }
-                            CompactButton(onClick = { activity.finish() }, colors = ButtonDefaults.primaryButtonColors(backgroundColor = Color(0xFFFF5555))) { Text("OFF") }
+            Box(Modifier.fillMaxSize().zIndex(500f).background(FluxBg), Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("[ FIRMWARE UPDATING ]", color = FluxPink, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("RX: CONFIG_PACKET_01", color = Color.Gray, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(15.dp))
+                    
+                    // Cyber Progress Bar
+                    Box(Modifier.width(120.dp).height(8.dp).border(1.dp, FluxCyan).background(FluxDark)) {
+                        Box(Modifier.fillMaxHeight().fillMaxWidth(syncProgress.value).background(FluxCyan))
+                    }
+                }
+            }
+        }
+
+        if (curtainAlpha < 1.0f) {
+            Text(
+                text = if (currentDeck == Deck.REACTOR) "REACTOR" else "CLINICAL",
+                color = if (currentDeck == Deck.REACTOR) FluxCyan else FluxPink,
+                fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp,
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 20.dp)
+            )
+
+            if (currentDeck == Deck.REACTOR) {
+                Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(110.dp)) {
+                        CircularProgressIndicator(progress = 1f, indicatorColor = FluxDark, strokeWidth = 6.dp, modifier = Modifier.fillMaxSize())
+                        val batCol = if(batteryLevel < 20) FluxPink else if(batteryLevel < 50) Color(0xFFFF9900) else FluxCyan
+                        CircularProgressIndicator(progress = batteryLevel / 100f, indicatorColor = batCol, strokeWidth = 6.dp, modifier = Modifier.fillMaxSize())
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("CORE", color = Color.Gray, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                            Text("$batteryLevel%", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(2.dp))
+                            Text(timeRemaining, color = FluxCyan, fontSize = 10.sp)
                         }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    FluxButton(
+                        text = if (isAudioMode) "AUDIO: ON" else "AUDIO: OFF",
+                        onClick = { isAudioMode = !isAudioMode; lastInteractionTime = System.currentTimeMillis() },
+                        color = if (isAudioMode) FluxPink else FluxCyan,
+                        modifier = Modifier.width(100.dp)
+                    )
+                }
+            } else {
+                val pName = when(activity.clinicalProfile) { 0 -> "PULSE"; 1 -> "GEIGER"; else -> "THROB" }
+                Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) {
+                    Spacer(Modifier.height(15.dp))
+                    Row(Modifier.fillMaxWidth().padding(horizontal=16.dp), Arrangement.SpaceBetween) {
+                         FluxLabel("BPM", "${activity.clinicalBpm}", FluxCyan)
+                         FluxLabel("INT", "${activity.clinicalIntensity}%", FluxCyan)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("PROG: ", color = Color.Gray, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(pName, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
+                    if (activity.clinicalSleep) Text("[SLEEP MODE ACTIVE]", color = FluxPink, fontSize = 8.sp, modifier = Modifier.padding(top = 2.dp))
+                    else Spacer(Modifier.height(14.dp))
+                    Spacer(Modifier.height(10.dp))
+                    FluxButton(text = "INITIALIZE", onClick = { isClinicalActive = true }, color = FluxPink, modifier = Modifier.width(110.dp))
+                }
+            }
+        }
+        
+        if (profileNameToast.isNotEmpty()) {
+            Box(Modifier.fillMaxSize().zIndex(400f), Alignment.Center) {
+                Box(Modifier.background(FluxDark.copy(alpha=0.9f), CutCornerShape(10.dp)).border(1.dp, FluxCyan, CutCornerShape(10.dp)).padding(horizontal = 20.dp, vertical = 10.dp)) {
+                    Text(profileNameToast, color = FluxCyan, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                }
+            }
+        }
+        
+        if (curtainAlpha > 0f) Box(Modifier.fillMaxSize().zIndex(100f).background(FluxBg.copy(alpha=curtainAlpha)))
+        if (countdownValue > 0) Box(Modifier.fillMaxSize().zIndex(200f).background(FluxBg), Alignment.Center) { Text("$countdownValue", fontSize = 60.sp, fontWeight = FontWeight.Black, color = FluxPink) }
+        
+        if (showExitDialog) {
+            Box(Modifier.fillMaxSize().zIndex(300f).background(FluxBg.copy(0.95f)), Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("TERMINATE?", color = FluxCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(15.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        FluxButton("RESUME", { showExitDialog = false }, FluxCyan, Modifier.width(70.dp))
+                        FluxButton("HALT", { activity.finish() }, FluxPink, Modifier.width(60.dp))
                     }
                 }
             }
         }
     }
-}
-
-@Composable
-fun ModeChip(label: String, index: Int, currentIndex: Int, onClick: () -> Unit) {
-    val isSelected = index == currentIndex
-    Chip(onClick = onClick, label = { Text(label, maxLines = 1) }, colors = if (isSelected) ChipDefaults.primaryChipColors() else ChipDefaults.secondaryChipColors(), modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp))
 }

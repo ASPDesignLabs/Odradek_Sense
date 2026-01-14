@@ -1,7 +1,6 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    // --- ADD THIS PLUGIN ---
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
@@ -18,7 +17,15 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
-    }
+
+        // 1. Configure the CMake flags inside DefaultConfig
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                arguments += "-DANDROID_STL=c++_shared"
+            }
+        }
+    } // <--- THIS BRACE WAS MISSING IN YOUR SNIPPET
 
     buildTypes {
         release {
@@ -42,10 +49,16 @@ android {
 
     buildFeatures {
         compose = true
+        prefab = true // <--- Required for Oboe
     }
 
-    // --- IMPORTANT: REMOVED composeOptions BLOCK ---
-    // Kotlin 2.0 handles this automatically via the plugin above.
+    // 2. Link the CMake build script here
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
     packaging {
         resources {
@@ -60,7 +73,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.1")
     implementation("androidx.compose.material3:material3:1.2.1")
 
-    // Play Services (For the Phone Bridge)
+    // NATIVE AUDIO LIB
+    implementation(libs.oboe)
+
+    // Play Services
     implementation("com.google.android.gms:play-services-wearable:18.2.0")
 
     // Compose BOM
